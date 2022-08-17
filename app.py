@@ -5,9 +5,9 @@
 
 # Default JSON encoder는 set를 JSON으로 변환하지 못 한다.
 # 따라서 커스텀 엔코더를 작성해서 set을 list로 변환해서 JSON으로 변환 가능하게 해준다.
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, current_app
 from flask.json import JSONEncoder
-
+from sqlalchemy import create_engine, text
 class CustomJSONEncoder(JSONEncoder):
     def default(self, obj):
         if isinstance(obj, set):
@@ -15,85 +15,146 @@ class CustomJSONEncoder(JSONEncoder):
 
         return JSONEncoder.default(self.obj)
 
-app = Flask(__name__)
-app.id_count = 1
-app.users = {}
-app.tweets = []
-app.json_encoder = CustomJSONEncoder
+def get_user(user_id):
+    user = current_app.database.execute(text("""
+        SELECT
+            id,
+            name,
+            email,
+            profile
+        FROM users
+        WHERE id = :user_id
+        """), {
+            'user_id' : user_id
+        }).fetchone()
 
-@app.route("/ping", methods=['GET'])
+    return {
+        'id' : user['id'],
+        'name' : user['name'],
+        'email' : user['email'],
+        'profile' : user['profile']
+    } if user else None
 
-def ping():
-    return "pong"
+def insert_user(user):
+    return current_app.database.execute(text("""
+        INSERT INTO users(
+            name,
+            email,
+            profile,
+            hashed_password
+        ) VALUES (
+            :name,
+            :email,
+            :profile,
+            :password
+        )
+    """), user).lastrowid
 
-@app.route("/sign-up", methods=['POST'])
-def sign_up():
-    new_user = request.json
-    new_user["id"] = app.id_count
-    app.users[app.id_count] = new_user
-    app.id_count = app.id_count + 1
+def insert_tweet(user_tweet):
+    return current_app.database.execute(text("""
+        INSERT INTO tweets(
+            user_id,
+            tweet
+        ) VALUES (
+            :id,
+            :tweet
+        )
+    """), user_tweet).rowcount
 
-    return jsonify(new_user)
+def insert_follow(user_follow):
+    return current_app.database.execute(text("""
+        INSERT INTO users_follow_list(
+            user_id,
+            follow_user_id
+        ) VALUES (
+            :id,
+            :follow
+        )
+    """), user_follow).rowcount
 
-@app.route("/tweet", methods=['POST'])
-def tweet():
-    payload = request.json
-    user_id = int(payload['id'])
-    tweet = payload['tweet']
+def insert_unfollow(user_unfollow):
+    return current_app.database.execute(text("""
+        DELETE FROM users_follow_list
+        WHERE user_id = :id
+        AND follow_user_id = :unfollow
+    """), user_unfollow).rowcount
 
-    if user_id not in app.users:
-        return 'User not exist', 400
+def get_timeline(user_id):
+    timeline = current_app.database.execute(text("""
+        SELECT
+            t.user_id,
+            t.tweet
+        FROM tweets t
+        LEFT JOIN users_follow_list ufl ON ufl.user_id = :user_id
+        WHERE t.user_id = :user_id
+        OR t.user_id = ufl.follow_user_id
+    """), {
+        'user_id' : user_id
+    }).fetchall()
 
-    if len(tweet) > 300:
-        return 'Over 300', 400
+    return [{
+        'user_id' : tweet['user_id'],
+        'tweet' : tweet['tweet']
+    } for tweet in timeline]
 
-    user_id = int(payload['id'])
-    app.tweets.append({
-        'user_id' : user_id,
-        'tweet' : tweet
-    })
+def create_app(test_config = None):
+    app = Flask(__name__)
 
-    return '', 200
+    app.json_encoder = CustomJSONEncoder
 
-@app.route("/follow", methods=['POST'])
-def follow():
-    payload = request.json
-    user_id = int(payload['id'])
-    user_id_to_follow = int(payload['follow'])
+    if test_config is None:
+        app.config.from_pyfile("config.py")
+    else:
+        app.config.update(test_config)
 
-    if user_id not in app.users or user_id_to_follow not in app.users:
-        return 'Not exist User', 400
+    database = create_engine(app.config['DB_URL'], encoding = 'utf-8', max_overflow = 0)
+    app.database = database
 
-    user = app.users[user_id]
-    user.setdefault('follow', set()).add(user_id_to_follow)
+    @app.route("/ping", methods=['GET'])
 
-    return jsonify(user)
+    def ping():
+        return "pong"
 
-@app.route("/unfollow", methods=['POST'])
-def unfollow():
-    payload = request.json
-    user_id = int(payload['id'])
-    user_id_to_follow = int(payload['follow'])
+    @app.route("/sign-up", methods=['POST'])
+    def sign_up():
+        new_user = request.json
+        new_user_id = insert_user(new_user)
+        new_user = get_user(new_user_id)
 
-    if user_id not in app.users or user_id_to_follow not in app.users:
-        return 'Not exist User', 400
+        return jsonify(new_user)
 
-    user = app.users[user_id]
-    user.setdefault('follow', set()).discard(user_id_to_follow)
+    @app.route("/tweet", methods=['POST'])
+    def tweet():
+        user_tweet = request.json
+        tweet = user_tweet['tweet']
 
-    return jsonify(user)
+        if len(tweet) > 300:
+            return 'Over 300', 400
 
-# URL에 인자를 전송하고 싶을 때는 <type:value> 형식으로 URL을 구성한다.
-@app.route("/timeline/<int:user_id>", methods=['GET'])
-def timeline(user_id):
-    if user_id not in app.users:
-        return 'Not exist User', 400
+        insert_tweet(user_tweet)
 
-    follow_list = app.users[user_id].get('follow', set())
-    follow_list.add(user_id)
-    timeline = [tweet for tweet in app.tweets if tweet['user_id'] in follow_list]
+        return '', 200
 
-    return jsonify({
-        'user_id'   : user_id,
-        'timeline'  : timeline
-    })
+    @app.route("/follow", methods=['POST'])
+    def follow():
+        payload = request.json
+        insert_follow(payload)
+
+        return '', 200
+
+    @app.route("/unfollow", methods=['POST'])
+    def unfollow():
+        payload = request.json
+        insert_unfollow(payload)
+
+        return '', 200
+
+    # URL에 인자를 전송하고 싶을 때는 <type:value> 형식으로 URL을 구성한다.
+    @app.route("/timeline/<int:user_id>", methods=['GET'])
+    def timeline(user_id):
+        return jsonify({
+            'user_id' : user_id,
+            'timeline' : get_timeline(user_id)
+        })
+        
+    return app
